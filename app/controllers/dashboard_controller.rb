@@ -178,6 +178,10 @@ class DashboardController < ApplicationController
     fetch_nodes
     fetch_extended
 
+    @twin_configured = @reflector_config.dig('twin', 'host').present?
+    @stats_scope = @twin_configured ? (params[:scope].presence_in(%w[single pair]) || 'single') : 'single'
+    merge_twin_nodes if @stats_scope == 'pair'
+
     visible = @nodes.reject { |_, n| n['hidden'] }
 
     # ── Live counts (current snapshot) ────────────────────────────────────────
@@ -390,6 +394,21 @@ class DashboardController < ApplicationController
         next if @nodes.key?(cs) # local node takes precedence
         @nodes[cs] = node.merge('_external' => ref_name, '_external_portal' => ref_data[:portal_url], '_external_type' => 'svx')
       end
+    end
+  end
+
+  # Folds the HA-pair twin's live node roster (status.twin.nodes, mirrored
+  # by GeuReflector's twin link) into @nodes for the "pair" stats scope.
+  # Only affects live counts computed from @nodes — historical stats stay
+  # per-instance since node_events isn't shared between twins.
+  def merge_twin_nodes
+    twin_nodes = @reflector_config.dig('twin', 'nodes')
+    return unless twin_nodes.is_a?(Array)
+    twin_nodes.each do |node|
+      next unless node.is_a?(Hash)
+      cs = node['callsign']
+      next if cs.blank? || @nodes.key?(cs)
+      @nodes[cs] = node.merge('_external_type' => 'twin')
     end
   end
 

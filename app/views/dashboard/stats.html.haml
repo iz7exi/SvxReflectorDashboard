@@ -158,6 +158,16 @@
           %i.bi.bi-exclamation-triangle-fill.mr-2.shrink-0
           = @fetch_error
 
+      -# ── Twin scope toggle (live counts only) ────────────────────────────
+      - if @twin_configured
+        .flex.items-center.gap-2.mb-3.flex-wrap
+          %span.text-gray-500.text-sm.mr-1 Twin scope:
+          - [['single', 'This node'], ['pair', 'Pair (both twins)']].each do |val, label|
+            %a.period-pill{href: stats_path(period: @period, scope: val), class: (@stats_scope == val ? 'active' : nil)}
+              = label
+          %span.text-gray-600{style: "font-size:.72rem"}
+            (live counts only — usage history below stays per-node)
+
       -# ── Stats row (same as dashboard) ──────────────────────────────────
       - stats = []
       - stats << {icon: 'bi-diagram-3',   color: 'text-gray-100',  label: 'Nodes',   val: @total}
