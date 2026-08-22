@@ -31,7 +31,7 @@ type dmrConn interface {
 	SetVoiceCallback(func(srcID uint32, frames [3][9]byte))
 	SetCallStartCallback(func(srcID, dstID uint32))
 	SetCallEndCallback(func(srcID uint32))
-	StartTX()
+	StartTX(srcID uint32)
 	SendVoice(ambe [9]byte) error
 	StopTX() error
 }
@@ -279,7 +279,21 @@ func runBridge(
 		ambeBuffer = ambeBuffer[:0]
 		ambeBufMu.Unlock()
 
-		dmr.StartTX()
+		// cs is already confirmed != this bridge's own callsign (checked
+		// above). If cs is actually another relay bridge's own fixed identity
+		// (Mumble/Zello/etc -- the SVX reflector protocol only ever shows a
+		// connected node's own fixed identity, never a per-message field, so
+		// those bridges can't pass through the real individual talker's name
+		// directly), check Redis for the real talker THEY published. Falls
+		// back to cs itself for a genuine direct SVX client (no Redis entry).
+		realCS := cs
+		if redisCli != nil {
+			if v, ok, _ := redisCli.Get("relay_talker:" + cs); ok && v != "" {
+				realCS = v
+			}
+		}
+		srcID, _ := lookupDMRIDByCallsign(realCS)
+		dmr.StartTX(srcID)
 	})
 
 	svx.SetTalkerStopCallback(func(tg uint32, cs string) {

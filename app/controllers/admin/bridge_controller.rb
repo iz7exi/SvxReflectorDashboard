@@ -639,7 +639,8 @@ module Admin
           "MUMBLE_CHANNEL=#{bridge.mumble_channel}",
           "MUMBLE_WELCOME=#{[bridge.mumble_welcome.to_s].pack('m0')}",
           "NODE_LOCATION=#{bridge.node_location.presence || bridge.name}",
-          "SYSOP=#{bridge.sysop}"
+          "SYSOP=#{bridge.sysop}",
+          "REDIS_URL=#{ENV.fetch('REDIS_URL', 'redis://redis:6379/1')}"
         ] + agc_env_array(bridge),
         HostConfig: {
           RestartPolicy: { Name: "unless-stopped" }

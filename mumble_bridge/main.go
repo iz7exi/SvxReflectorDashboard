@@ -38,6 +38,7 @@ func main() {
 	callsign := envRequired("CALLSIGN")
 	nodeLocation := envDefault("NODE_LOCATION", "")
 	sysop := envDefault("SYSOP", "")
+	redisURL := os.Getenv("REDIS_URL")
 
 	mumbleHost := envRequired("MUMBLE_HOST")
 	mumblePort := envInt("MUMBLE_PORT", 64738)
@@ -47,6 +48,25 @@ func main() {
 
 	log.Printf("Config: SVX=%s:%d TG=%d | Mumble=%s:%d user=%s channel=%q",
 		svxHost, svxPort, svxTG, mumbleHost, mumblePort, mumbleUser, mumbleChannel)
+
+	// --- Redis client: publishes the REAL Mumble talker's name, keyed by
+	// this bridge's own fixed SVX callsign. The SVX reflector protocol only
+	// ever shows the connected node's own fixed identity to other clients
+	// (not a per-message field), so the DMR bridge on the other end can't
+	// see who's really talking on Mumble from the SVX TalkerStart message
+	// alone -- it reads this Redis key instead to find out.
+	var redisCli *RedisClient
+	if redisURL != "" {
+		rc, err := ParseRedisURL(redisURL)
+		if err != nil {
+			log.Printf("[Redis] URL parse error: %v (real-talker publishing disabled)", err)
+		} else if err := rc.Connect(); err != nil {
+			log.Printf("[Redis] Connect error: %v (real-talker publishing disabled)", err)
+		} else {
+			redisCli = rc
+			log.Println("[Redis] Connected for real-talker publishing")
+		}
+	}
 
 	// SVX Opus: decode incoming TG audio at 48kHz (libopus upsamples
 	// svxlink's 16kHz stream to Mumble's native rate); encode SVX-bound
@@ -70,7 +90,7 @@ func main() {
 	for {
 		err := runBridge(svxHost, svxPort, svxAuthKey, svxTG, callsign, nodeLocation, sysop,
 			mumbleHost, mumblePort, mumbleUser, mumblePass, mumbleChannel,
-			svxDec, svxEnc, sigCh)
+			svxDec, svxEnc, sigCh, redisCli)
 		if err == errShutdown {
 			log.Println("Goodbye")
 			return
@@ -96,7 +116,7 @@ var errShutdown = fmt.Errorf("shutdown")
 func runBridge(
 	svxHost string, svxPort int, svxAuthKey string, svxTG uint32, callsign, nodeLocation, sysop string,
 	mumbleHost string, mumblePort int, mumbleUser, mumblePass, mumbleChannel string,
-	svxDec *opus.Decoder, svxEnc *opus.Encoder, sigCh <-chan os.Signal,
+	svxDec *opus.Decoder, svxEnc *opus.Encoder, sigCh <-chan os.Signal, redisCli *RedisClient,
 ) error {
 	var (
 		// Half-duplex state: who currently owns the TG.
@@ -234,6 +254,11 @@ func runBridge(
 		talker := sender
 		if talker == "" {
 			talker = callsign
+		}
+		if redisCli != nil {
+			if err := redisCli.SetEX("relay_talker:"+callsign, 30, talker); err != nil {
+				log.Printf("[Redis] SETEX error: %v", err)
+			}
 		}
 		svx.SendTalkerStart(svxTG, talker)
 		log.Printf("[Mumble->SVX] Stream start from %q", sender)

@@ -25,6 +25,7 @@ type DMRClient struct {
 
 	// TX state
 	txStreamID uint32
+	txSrcID    uint32 // real per-call source ID (SVX talker), falls back to rptID
 	txSeq      byte
 	txBurst    int // 0-5 (A-F) burst counter
 	txBuf      [][9]byte
@@ -142,7 +143,6 @@ func (c *DMRClient) Connect() error {
 	// ACK this, so we send it best-effort and do not block waiting for a
 	// reply.
 	if c.options != "" {
-
 		if _, err := c.conn.Write(BuildOptionsPacket(c.rptID, c.options)); err != nil {
 			log.Printf("[DMR] send RPTO: %v", err)
 		} else {
@@ -298,20 +298,24 @@ func (c *DMRClient) RunReader() {
 }
 
 // StartTX begins a new voice transmission to the DMR network.
-func (c *DMRClient) StartTX() {
+func (c *DMRClient) StartTX(srcID uint32) {
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
+	if srcID == 0 {
+		srcID = c.rptID
+	}
+	c.txSrcID = srcID
 	c.txStreamID = rand.Uint32()
 	c.txActive = true
 	c.txSeq = 0
 	c.txBurst = 0
 	c.txBuf = c.txBuf[:0]
 
-	log.Printf("[DMR] TX start: stream=%08X TG=%d TS=%d", c.txStreamID, c.talkgroup, c.timeslot+1)
+	log.Printf("[DMR] TX start: stream=%08X TG=%d TS=%d src=%d", c.txStreamID, c.talkgroup, c.timeslot+1, c.txSrcID)
 
 	// Send Voice LC Header
-	header := BuildVoiceLCHeader(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+	header := BuildVoiceLCHeader(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 		c.txStreamID, c.timeslot, CallTypeGroup)
 	c.conn.Write(header)
 	c.txSeq++
@@ -345,7 +349,7 @@ func (c *DMRClient) SendVoice(ambe [9]byte) error {
 		frameType = FrameTypeVoice
 	}
 
-	pkt := BuildDMRDFrame(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+	pkt := BuildDMRDFrame(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 		c.timeslot, CallTypeGroup, frameType, byte(c.txBurst), c.txStreamID, payload)
 
 	_, err := c.conn.Write(pkt)
@@ -378,14 +382,14 @@ func (c *DMRClient) StopTX() error {
 		} else {
 			frameType = FrameTypeVoice
 		}
-		pkt := BuildDMRDFrame(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+		pkt := BuildDMRDFrame(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 			c.timeslot, CallTypeGroup, frameType, byte(c.txBurst), c.txStreamID, payload)
 		c.conn.Write(pkt)
 		c.txSeq++
 	}
 
 	// Send Voice Terminator
-	term := BuildVoiceTerminator(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+	term := BuildVoiceTerminator(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 		c.txStreamID, c.timeslot, CallTypeGroup)
 	_, err := c.conn.Write(term)
 
