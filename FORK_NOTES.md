@@ -52,6 +52,3 @@ SVX->BM audio produced no carrier: the bridge only sent the REWIND SuperHeader (
 
 *(Not yet submitted upstream as of this writing — a good next PR.)*
 
----
-
-*Questions specific to this fork: reach out to IZ7EXI directly, or via IK1JNS.*
