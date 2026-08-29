@@ -292,6 +292,14 @@ func runBridge(
 				realCS = v
 			}
 		}
+		// Strip any suffix after the first hyphen (e.g. Zello usernames like
+		// "iz7exi-mobile", "iz7exi-maurizio"). Real amateur radio callsigns
+		// never contain a hyphen (enforced by the dashboard's own callsign
+		// format validation), so this is always safe and never truncates a
+		// genuine callsign.
+		if idx := strings.Index(realCS, "-"); idx > 0 {
+			realCS = realCS[:idx]
+		}
 		srcID, _ := lookupDMRIDByCallsign(realCS)
 		dmr.StartTX(srcID)
 	})

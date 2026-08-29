@@ -313,6 +313,12 @@ func runBridge(
 		if redisCli != nil {
 			val, _ := json.Marshal(map[string]string{"from": senderName, "channel": zelloChannel})
 			redisCli.SetEX("zello_rx:"+strings.TrimSpace(callsign), 30, string(val))
+			// Also publish under the generic relay_talker key that dmr_bridge
+			// (and any other relay-aware bridge) already checks before falling
+			// back to this bridge's own fixed identity -- lets DMR-side
+			// listeners see the real Zello speaker instead of always seeing
+			// this bridge's own callsign.
+			redisCli.SetEX("relay_talker:"+strings.TrimSpace(callsign), 30, senderName)
 		}
 
 		if zelloAudioTimer != nil {
