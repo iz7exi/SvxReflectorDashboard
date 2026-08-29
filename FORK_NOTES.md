@@ -45,10 +45,11 @@ SVX->BM audio produced no carrier: the bridge only sent the REWIND SuperHeader (
 
 *(Upstream PR: "Fix ODMRTP: BrandMeister silently ignores SVX->DMR audio")*
 
-## Real caller identity SVX<->DMR, including relayed via Mumble
-
-- SVX->DMR: when a real SVX-side talker (not the bridge's own fixed identity) transmits, their real DMR ID is looked up (reverse radioid.net index) and used as the DMR frame's source ID — works directly and through Mumble relay (mumble_bridge publishes the real talker's name to Redis, since the SVX reflector protocol itself can't carry it through a relay).
-- **Known limitation, not yet fixed here**: entering a DMR ID with an SSID suffix (9 digits, e.g. `222727201` — a valid convention for hotspot multi-connections) silently truncates to 24 bits with no warning, producing a garbage on-air ID. Root-caused; a form-side validation fix is a good next step for anyone picking this up.
+## Real caller identity SVX<->DMR, including relayed via Mumble and Zello
+- SVX->DMR: when a real SVX-side talker (not the bridge's own fixed identity) transmits, their real DMR ID is looked up (reverse radioid.net index) and used as the DMR frame's source ID, working directly and through Mumble/Zello relay (both bridges publish the real talker's name to Redis, since the SVX reflector protocol itself can't carry it through a relay).
+- Zello usernames commonly carry a device/user suffix after a hyphen (e.g. `iz7exi-mobile`, `iz7exi-maurizio`); dmr_bridge strips everything from the first hyphen onward before the lookup, safe unconditionally since real callsigns never contain a hyphen.
+- **Known limitation, not yet fixed here**: entering a DMR ID with an SSID suffix (9 digits, e.g. `222727201`, a valid convention for hotspot multi-connections) silently truncates to 24 bits with no warning, producing a garbage on-air ID. Root-caused; a form-side validation fix is a good next step for anyone picking this up.
+*(Not yet submitted upstream as of this writing, a good next PR.)*
 
 *(Not yet submitted upstream as of this writing — a good next PR.)*
 
