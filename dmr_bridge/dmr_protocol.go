@@ -347,6 +347,56 @@ func BuildConfigPacket(rptID uint32, callsign string, rxFreq, txFreq string,
 	return buf
 }
 
+// BuildConfigPacketTGIF creates an RPTC configuration packet using TGIF's
+// own real field layout (303 bytes), verified byte-for-byte against TGIF's
+// published server source (tgif.network/hblink.py). This differs from the
+// standard 302-byte layout used by BuildConfigPacket (HBLink3, BrandMeister,
+// ADN, etc.) by one extra 1-byte SLOTS field between DESCRIPTION and URL --
+// using this on a master that expects the standard layout would misalign
+// every field after DESCRIPTION, so this is intentionally a separate
+// function rather than a modification to the shared one.
+func BuildConfigPacketTGIF(rptID uint32, callsign string, rxFreq, txFreq string,
+	txPower, colorCode, lat, lon, height string,
+	location, description, slots, url, softwareID, packageID string) []byte {
+	buf := make([]byte, 303)
+	copy(buf[0:4], SigRPTC)
+	binary.BigEndian.PutUint32(buf[4:8], rptID)
+	// Callsign (8 bytes, space-padded)
+	cs := padRight(callsign, 8)
+	copy(buf[8:16], cs)
+	// RX Freq (9 bytes, zero-padded)
+	copy(buf[16:25], padRight(rxFreq, 9))
+	// TX Freq (9 bytes, zero-padded)
+	copy(buf[25:34], padRight(txFreq, 9))
+	// TX Power (2 bytes)
+	copy(buf[34:36], padRight(txPower, 2))
+	// Color Code (2 bytes)
+	copy(buf[36:38], padRight(colorCode, 2))
+	// Latitude (8 bytes)
+	copy(buf[38:46], padRight(lat, 8))
+	// Longitude (9 bytes)
+	copy(buf[46:55], padRight(lon, 9))
+	// Height (3 bytes)
+	copy(buf[55:58], padRight(height, 3))
+	// Location (20 bytes)
+	copy(buf[58:78], padRight(location, 20))
+	// Description (19 bytes)
+	copy(buf[78:97], padRight(description, 19))
+	// Slots (1 byte) -- present on TGIF's real layout, absent from the
+	// standard one.
+	copy(buf[97:98], padRight(slots, 1))
+	// URL (124 bytes)
+	copy(buf[98:222], padRight(url, 124))
+	// Software ID (40 bytes)
+	copy(buf[222:262], padRight(softwareID, 40))
+	// Package ID (40 bytes)
+	copy(buf[262:302], padRight(packageID, 40))
+	// Null terminator
+	buf[302] = 0
+
+	return buf
+}
+
 // SigRPTO is the RPTO (repeater options) command signature.
 const SigRPTO = "RPTO"
 

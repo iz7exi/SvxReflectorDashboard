@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +18,8 @@ type DMRClient struct {
 	password  string
 	callsign  string
 	options   string
+	rxFreq    string
+	txFreq    string
 	talkgroup uint32
 	timeslot  byte
 	colorCode byte
@@ -45,7 +48,7 @@ type DMRClient struct {
 	missedPings int
 }
 
-func NewDMRClient(host string, port int, rptID uint32, password, callsign, options string,
+func NewDMRClient(host string, port int, rptID uint32, password, callsign, options, rxFreq, txFreq string,
 	talkgroup uint32, timeslot, colorCode byte) *DMRClient {
 	return &DMRClient{
 		host:      host,
@@ -54,6 +57,8 @@ func NewDMRClient(host string, port int, rptID uint32, password, callsign, optio
 		password:  password,
 		callsign:  callsign,
 		options:   options,
+		rxFreq:    rxFreq,
+		txFreq:    txFreq,
 		talkgroup: talkgroup,
 		timeslot:  timeslot,
 		colorCode: colorCode,
@@ -124,11 +129,33 @@ func (c *DMRClient) Connect() error {
 
 	// Step 3: Send RPTC (config)
 	ccStr := fmt.Sprintf("%d", c.colorCode)
-	configPkt := BuildConfigPacket(c.rptID, c.callsign,
-		"000000000", "000000000", // RX/TX freq (not applicable for bridge)
-		"01", ccStr,
-		"0.0000", "0.0000", "000", // lat, lon, height
-		"DMR Bridge", "STFU_0.3.4 Linux x86_64", "", "DMR_Bridge", "1.0")
+	rx := c.rxFreq
+	if rx == "" {
+		rx = "000000000"
+	}
+	tx := c.txFreq
+	if tx == "" {
+		tx = "000000000"
+	}
+	// TGIF_SWITCH_APPLIED -- TGIF's real RPTC layout has an extra 1-byte
+	// SLOTS field the standard Homebrew layout doesn't (verified against
+	// TGIF's own published source); using the standard layout against TGIF
+	// misaligns every field after DESCRIPTION. Every other master (HBLink3,
+	// BrandMeister, ADN, etc.) keeps using the unmodified standard function.
+	var configPkt []byte
+	if strings.Contains(strings.ToLower(c.host), "tgif") {
+		configPkt = BuildConfigPacketTGIF(c.rptID, c.callsign,
+			rx, tx,
+			"01", ccStr,
+			"0.0000", "0.0000", "000", // lat, lon, height
+			"DMR Bridge", "", "2", "", "20260827", "MMDVM")
+	} else {
+		configPkt = BuildConfigPacket(c.rptID, c.callsign,
+			rx, tx,
+			"01", ccStr,
+			"0.0000", "0.0000", "000", // lat, lon, height
+			"DMR Bridge", "", "", "20260827", "MMDVM")
+	}
 	if _, err := c.conn.Write(configPkt); err != nil {
 		return fmt.Errorf("send RPTC: %w", err)
 	}
