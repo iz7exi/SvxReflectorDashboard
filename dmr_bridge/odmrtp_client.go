@@ -285,7 +285,7 @@ func (c *ODMRTPClient) endCall() {
 }
 
 // StartTX announces a new outbound call with a super header.
-func (c *ODMRTPClient) StartTX(srcID uint32) {
+func (c *ODMRTPClient) StartTX(srcID uint32, callsign string) {
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
@@ -295,9 +295,18 @@ func (c *ODMRTPClient) StartTX(srcID uint32) {
 	// "received but not routed" red-dot entry on Last Heard). Always use
 	// the bridge's own base ID, matching the original working fix.
 	srcID = c.dmrID
+	// REAL_CALLSIGN_FOR_DISPLAY -- routing requires srcID to stay the base
+	// ID above, but the SuperHeader's callsign field is separate display
+	// metadata BrandMeister doesn't use for routing decisions. Show the
+	// real caller's callsign there when known, falling back to the
+	// bridge's own configured callsign otherwise.
+	displayCall := c.callsign
+	if callsign != "" {
+		displayCall = callsign
+	}
 	c.txBuf = c.txBuf[:0]
-	log.Printf("[ODMRTP] TX start: TG=%d src=%d", c.talkgroup, srcID)
-	sh := buildSuperHeader(rewindSessionGroupVoice, srcID, c.talkgroup, c.callsign)
+	log.Printf("[ODMRTP] TX start: TG=%d src=%d callsign=%s", c.talkgroup, srcID, displayCall)
+	sh := buildSuperHeader(rewindSessionGroupVoice, srcID, c.talkgroup, displayCall)
 	c.sendRealtime(rewindTypeSuperHeader, sh)
 	// The SuperHeader above is only an optional display enhancement (per
 	// REWIND_OPTION_SUPER_HEADER); it does NOT announce the call to

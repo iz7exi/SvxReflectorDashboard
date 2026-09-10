@@ -325,7 +325,8 @@ func (c *DMRClient) RunReader() {
 }
 
 // StartTX begins a new voice transmission to the DMR network.
-func (c *DMRClient) StartTX(srcID uint32) {
+func (c *DMRClient) StartTX(srcID uint32, callsign string) {
+	_ = callsign // Homebrew path unaffected; real-caller ID already used for srcID here
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 

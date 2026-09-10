@@ -31,7 +31,7 @@ type dmrConn interface {
 	SetVoiceCallback(func(srcID uint32, frames [3][9]byte))
 	SetCallStartCallback(func(srcID, dstID uint32))
 	SetCallEndCallback(func(srcID uint32))
-	StartTX(srcID uint32)
+	StartTX(srcID uint32, callsign string) // REAL_CALLSIGN_DISPLAY
 	SendVoice(ambe [9]byte) error
 	StopTX() error
 }
@@ -304,7 +304,7 @@ func runBridge(
 			realCS = realCS[:idx]
 		}
 		srcID, _ := lookupDMRIDByCallsign(realCS)
-		dmr.StartTX(srcID)
+		dmr.StartTX(srcID, realCS)
 	})
 
 	svx.SetTalkerStopCallback(func(tg uint32, cs string) {
