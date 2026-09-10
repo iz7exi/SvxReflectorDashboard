@@ -285,14 +285,28 @@ func (c *ODMRTPClient) endCall() {
 }
 
 // StartTX announces a new outbound call with a super header.
-func (c *ODMRTPClient) StartTX() {
+func (c *ODMRTPClient) StartTX(srcID uint32) {
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
+	// ODMRTP_FORCE_BASE_ID -- BrandMeister requires the DMRD/LC source ID
+	// to match the authenticated peer's own registered ID, not the real
+	// caller's personal ID (confirmed today: a mismatched src produced a
+	// "received but not routed" red-dot entry on Last Heard). Always use
+	// the bridge's own base ID, matching the original working fix.
+	srcID = c.dmrID
 	c.txBuf = c.txBuf[:0]
-	log.Printf("[ODMRTP] TX start: TG=%d src=%d", c.talkgroup, c.dmrID)
-	sh := buildSuperHeader(rewindSessionGroupVoice, c.dmrID, c.talkgroup, c.callsign)
+	log.Printf("[ODMRTP] TX start: TG=%d src=%d", c.talkgroup, srcID)
+	sh := buildSuperHeader(rewindSessionGroupVoice, srcID, c.talkgroup, c.callsign)
 	c.sendRealtime(rewindTypeSuperHeader, sh)
+	// The SuperHeader above is only an optional display enhancement (per
+	// REWIND_OPTION_SUPER_HEADER); it does NOT announce the call to
+	// BrandMeister's DMR routing core. That requires the real DMR Voice
+	// Header (Grp_V_Ch_Usr LC PDU) -- same 12-byte LC+RS(12,9) content our
+	// Homebrew path already builds and has verified correct. Without this,
+	// BrandMeister silently never opens/routes the call.
+	lc := buildFullLC(c.talkgroup, srcID, CallTypeGroup)
+	c.sendRealtime(rewindTypeDMRStart, lc[:])
 }
 
 // SendVoice buffers an AMBE frame and emits an audio packet every 3 frames.
