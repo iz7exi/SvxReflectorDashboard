@@ -289,9 +289,12 @@ func (c *ODMRTPClient) StartTX(srcID uint32) {
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
-	if srcID == 0 {
-		srcID = c.dmrID
-	}
+	// ODMRTP_FORCE_BASE_ID -- BrandMeister requires the DMRD/LC source ID
+	// to match the authenticated peer's own registered ID, not the real
+	// caller's personal ID (confirmed today: a mismatched src produced a
+	// "received but not routed" red-dot entry on Last Heard). Always use
+	// the bridge's own base ID, matching the original working fix.
+	srcID = c.dmrID
 	c.txBuf = c.txBuf[:0]
 	log.Printf("[ODMRTP] TX start: TG=%d src=%d", c.talkgroup, srcID)
 	sh := buildSuperHeader(rewindSessionGroupVoice, srcID, c.talkgroup, c.callsign)
