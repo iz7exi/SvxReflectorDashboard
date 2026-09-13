@@ -291,6 +291,7 @@ func runBridge(
 		// back to cs itself for a genuine direct SVX client (no Redis entry).
 		realCS := cs
 		if redisCli != nil {
+			redisCli.EnsureConnected()
 			if v, ok, _ := redisCli.Get("relay_talker:" + cs); ok && v != "" {
 				realCS = v
 			}
@@ -366,6 +367,7 @@ func runBridge(
 		// reflector announces the talker instead of racing this SETEX.
 		if redisCli != nil {
 			val := dmrRxJSON(srcID, dmrTalkgroup, dmrTimeslot)
+			redisCli.EnsureConnected()
 			if err := redisCli.SetEX(redisKey, 30, val); err != nil {
 				log.Printf("[Redis] SETEX error: %v", err)
 			}
@@ -424,6 +426,7 @@ func runBridge(
 		// Refresh Redis TTL
 		if redisCli != nil {
 			val := dmrRxJSON(srcID, dmrTalkgroup, dmrTimeslot)
+			redisCli.EnsureConnected()
 			if err := redisCli.SetEX(redisKey, 30, val); err != nil {
 				log.Printf("[Redis] SETEX error: %v", err)
 			}

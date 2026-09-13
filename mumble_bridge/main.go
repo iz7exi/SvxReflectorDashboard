@@ -60,11 +60,25 @@ func main() {
 		rc, err := ParseRedisURL(redisURL)
 		if err != nil {
 			log.Printf("[Redis] URL parse error: %v (real-talker publishing disabled)", err)
-		} else if err := rc.Connect(); err != nil {
-			log.Printf("[Redis] Connect error: %v (real-talker publishing disabled)", err)
 		} else {
-			redisCli = rc
-			log.Println("[Redis] Connected for real-talker publishing")
+			// REDIS_STARTUP_RETRY -- a container that starts before Docker's
+			// embedded DNS has registered the "redis" hostname (common right
+			// after a stack-wide restart) used to fail this single attempt
+			// and disable real-talker publishing for the rest of the
+			// process's life. Retry a few times with a short delay first.
+			var connErr error
+			for attempt := 1; attempt <= 5; attempt++ {
+				if connErr = rc.Connect(); connErr == nil {
+					break
+				}
+				time.Sleep(3 * time.Second)
+			}
+			if connErr != nil {
+				log.Printf("[Redis] Connect error after retries: %v (real-talker publishing disabled)", connErr)
+			} else {
+				redisCli = rc
+				log.Println("[Redis] Connected for real-talker publishing")
+			}
 		}
 	}
 
@@ -256,6 +270,7 @@ func runBridge(
 			talker = callsign
 		}
 		if redisCli != nil {
+			redisCli.EnsureConnected()
 			if err := redisCli.SetEX("relay_talker:"+callsign, 30, talker); err != nil {
 				log.Printf("[Redis] SETEX error: %v", err)
 			}

@@ -154,11 +154,25 @@ func runBridge(
 		rc, err := ParseRedisURL(redisURL)
 		if err != nil {
 			log.Printf("[Redis] URL parse error: %v (disabled)", err)
-		} else if err := rc.Connect(); err != nil {
-			log.Printf("[Redis] Connect error: %v (disabled)", err)
 		} else {
-			redisCli = rc
-			log.Println("[Redis] Connected")
+			// REDIS_STARTUP_RETRY -- a container that starts before Docker's
+			// embedded DNS has registered the "redis" hostname (common right
+			// after a stack-wide restart) used to fail this single attempt
+			// and disable real-talker publishing for the rest of the
+			// process's life. Retry a few times with a short delay first.
+			var connErr error
+			for attempt := 1; attempt <= 5; attempt++ {
+				if connErr = rc.Connect(); connErr == nil {
+					break
+				}
+				time.Sleep(3 * time.Second)
+			}
+			if connErr != nil {
+				log.Printf("[Redis] Connect error after retries: %v (disabled)", connErr)
+			} else {
+				redisCli = rc
+				log.Println("[Redis] Connected")
+			}
 		}
 	}
 
@@ -312,12 +326,14 @@ func runBridge(
 		// Publish Zello caller info to Redis
 		if redisCli != nil {
 			val, _ := json.Marshal(map[string]string{"from": senderName, "channel": zelloChannel})
+			redisCli.EnsureConnected()
 			redisCli.SetEX("zello_rx:"+strings.TrimSpace(callsign), 30, string(val))
 			// Also publish under the generic relay_talker key that dmr_bridge
 			// (and any other relay-aware bridge) already checks before falling
 			// back to this bridge's own fixed identity -- lets DMR-side
 			// listeners see the real Zello speaker instead of always seeing
 			// this bridge's own callsign.
+			redisCli.EnsureConnected()
 			redisCli.SetEX("relay_talker:"+strings.TrimSpace(callsign), 30, senderName)
 		}
 
