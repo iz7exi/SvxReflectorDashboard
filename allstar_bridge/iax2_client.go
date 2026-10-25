@@ -12,7 +12,8 @@ import (
 type IAX2Client struct {
 	host     string
 	port     int
-	node     string // AllStar node number
+	node      string // AllStar node number to CALL
+	localNode string // our own identity (calling number/username)
 	password string
 	server   string // AllStar server hostname
 	callsign string
@@ -26,6 +27,10 @@ type IAX2Client struct {
 	callStart  time.Time
 	callToken  []byte
 	registered bool
+	firstVoice bool // next audio frame must be a full VOICE frame
+	keyed      bool // true while WE are transmitting toward the node
+	audioTS    uint32 // monotonic 20ms-stepped timestamp for outgoing audio
+	tsHigh     uint16
 
 	// Callbacks
 	onAudio func(pcm []int16)
@@ -35,11 +40,15 @@ type IAX2Client struct {
 	closed bool
 }
 
-func NewIAX2Client(host string, port int, node, password, server, callsign string) *IAX2Client {
+func NewIAX2Client(host string, port int, node, localNode, password, server, callsign string) *IAX2Client {
+	if localNode == "" {
+		localNode = node
+	}
 	return &IAX2Client{
 		host:      host,
 		port:      port,
 		node:      node,
+		localNode: localNode,
 		password:  password,
 		server:    server,
 		callsign:  callsign,
@@ -126,14 +135,20 @@ func (c *IAX2Client) Connect() error {
 	var ies []byte
 	ies = append(ies, BuildIEUint16(IAX_IE_VERSION, 2)...)
 	ies = append(ies, BuildIEString(IAX_IE_CALLED_NUMBER, c.node)...)
-	ies = append(ies, BuildIEString(IAX_IE_CALLING_NUMBER, c.node)...)
+	ies = append(ies, BuildIEString(IAX_IE_CALLING_NUMBER, c.localNode)...)
 	ies = append(ies, BuildIEString(IAX_IE_CALLING_NAME, c.callsign)...)
-	ies = append(ies, BuildIEString(IAX_IE_USERNAME, c.node)...)
+	ies = append(ies, BuildIEString(IAX_IE_USERNAME, c.localNode)...)
 	ies = append(ies, BuildIEUint32(IAX_IE_FORMAT, AST_FORMAT_ULAW)...)
 	ies = append(ies, BuildIE(IAX_IE_CALLTOKEN, c.callToken)...)
 
 	c.mu.Lock()
 	c.dstCallNo = 0 // reset for new call
+	// OSEQ_RESET_BEFORE_REAL_NEW -- the first NEW (empty CALLTOKEN request)
+	// is only a token-fetch preamble; Asterisk discards it and expects the
+	// real token-bearing NEW to start the call's own sequence at OSeqno 0.
+	// Without this reset the second NEW went out at OSeqno 1, so Asterisk
+	// saw a sequence gap and replied VNAK instead of AUTHREQ/ACCEPT.
+	c.oseq = 0
 	c.mu.Unlock()
 	if err := c.sendFull(AST_FRAME_IAX, IAX_COMMAND_NEW, ies); err != nil {
 		return fmt.Errorf("send NEW: %w", err)
@@ -172,7 +187,14 @@ func (c *IAX2Client) Connect() error {
 			case IAX_COMMAND_ACCEPT:
 				c.sendACK(frame.Timestamp)
 				log.Println("[IAX2] Call accepted")
-				continue
+				// ACCEPT_MEANS_CONNECTED -- an AllStar rpt() node answers the
+				// call with ACCEPT and then bridges audio immediately; it does
+				// NOT send a separate RINGING/ANSWER control frame the way a
+				// regular Asterisk extension would. Waiting for one just timed
+				// out after 10s. ACCEPT is the go signal, so treat it as connected.
+				log.Printf("[IAX2] Connected to AllStar node %s", c.node)
+				c.sendFull(AST_FRAME_TEXT, 0, []byte(NEWKEY1))
+				return nil
 
 			case IAX_COMMAND_REJECT:
 				cause := IEString(frame.IEs, IAX_IE_CAUSE)
@@ -190,6 +212,7 @@ func (c *IAX2Client) Connect() error {
 			c.sendACK(frame.Timestamp)
 			if frame.Subclass == AST_CONTROL_ANSWER || frame.Subclass == AST_CONTROL_RINGING {
 				log.Printf("[IAX2] Connected to AllStar node %s", c.node)
+				c.sendFull(AST_FRAME_TEXT, 0, []byte(NEWKEY1))
 				return nil
 			}
 		}
@@ -201,19 +224,48 @@ func (c *IAX2Client) Connect() error {
 
 // SendAudio sends a ulaw audio frame as a mini frame.
 func (c *IAX2Client) SendAudio(ulaw []byte) error {
-	ts := uint16(c.timestamp() & 0xFFFF)
-	pkt := BuildMiniFrame(c.srcCallNo, ts, ulaw)
+	// Audio timestamp must advance exactly 20ms per 160-sample frame,
+	// not follow wall-clock time (which jitters and makes the node
+	// render choppy/robotic audio). The first frame of a transmission,
+	// and every time the high 16 bits roll over, is a FULL VOICE frame
+	// (the node ignores a stream that starts with a mini frame).
+	c.mu.Lock()
+	ts := c.audioTS
+	c.audioTS += 20
+	needFull := c.firstVoice
+	c.firstVoice = false
+	if needFull {
+		pkt := BuildFullFrame(c.srcCallNo, c.dstCallNo, ts, c.oseq, c.iseq, AST_FRAME_VOICE, AST_FORMAT_ULAW, ulaw)
+		c.oseq++
+		c.mu.Unlock()
+		_, err := c.conn.Write(pkt)
+		return err
+	}
+	c.mu.Unlock()
+	pkt := BuildMiniFrame(c.srcCallNo, uint16(ts&0xFFFF), ulaw)
 	_, err := c.conn.Write(pkt)
 	return err
 }
 
 // SendKey sends a PTT key (start TX) control frame.
 func (c *IAX2Client) SendKey() error {
+	// Mark that the next audio frame must be a full VOICE frame so the
+	// node opens the stream. AllStar derives PTT from the voice frames
+	// themselves, so the KEY control frame is not strictly required, but
+	// we keep sending it harmlessly for compatibility.
+	c.mu.Lock()
+	c.firstVoice = true
+	c.keyed = true
+	c.audioTS = 0
+	c.mu.Unlock()
 	return c.sendFull(AST_FRAME_CONTROL, AST_CONTROL_KEY, nil)
 }
 
 // SendUnkey sends a PTT unkey (stop TX) control frame.
 func (c *IAX2Client) SendUnkey() error {
+	c.mu.Lock()
+	c.keyed = false
+	c.mu.Unlock()
 	return c.sendFull(AST_FRAME_CONTROL, AST_CONTROL_UNKEY, nil)
 }
 
@@ -300,7 +352,8 @@ func (c *IAX2Client) RunReader() {
 			}
 
 		case AST_FRAME_VOICE:
-			if frame.Subclass == AST_FORMAT_ULAW && len(frame.RawPayload) > 0 && c.onAudio != nil {
+			c.mu.Lock(); keyedV := c.keyed; c.mu.Unlock()
+			if frame.Subclass == AST_FORMAT_ULAW && len(frame.RawPayload) > 0 && c.onAudio != nil && !keyedV {
 				pcm := UlawToPCM(frame.RawPayload)
 				c.onAudio(pcm)
 			}

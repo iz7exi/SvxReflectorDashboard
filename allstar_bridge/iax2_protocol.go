@@ -113,7 +113,7 @@ func ParseFullFrame(data []byte) *IAX2FullFrame {
 		OSeqno:     data[8],
 		ISeqno:     data[9],
 		FrameType:  data[10],
-		Subclass:   data[11],
+		Subclass:   data[11] & 0x7f,
 		IEs:        make(map[byte][]byte),
 	}
 
@@ -205,3 +205,7 @@ func IEString(ies map[byte][]byte, key byte) string {
 	}
 	return ""
 }
+
+// NEWKEY1 TEXT handshake sent right after the call is answered;
+// without it the AllStar node echoes our audio back in a loop.
+const NEWKEY1 = "!NEWKEY1!"

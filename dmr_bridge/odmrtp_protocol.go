@@ -151,3 +151,93 @@ func parseSuperHeader(payload []byte) (sessionType, srcID, dstID uint32, ok bool
 		binary.LittleEndian.Uint32(payload[4:8]),
 		binary.LittleEndian.Uint32(payload[8:12]), true
 }
+
+// TALKER_ALIAS_SUPPORT -- ETSI TS 102 361-2 Talker Alias (added 2016), FLCO
+// 0x04-0x07. BrandMeister passes this through over ODMRTP's dedicated
+// rewindTypeDMREmbedded message type (confirmed via their own wiki: "Pass-thru
+// of embedded signaling data (TalkerAlias and GPS) over BrandMeister if
+// protocol supports this"). Format 1 = ISO 8859-1 (plain 8-bit ASCII/Latin-1),
+// the simplest fit for amateur radio callsigns.
+const (
+	flcoTalkerAliasHeader = 0x04
+	flcoTalkerAliasBlock1 = 0x05
+	flcoTalkerAliasBlock2 = 0x06
+	flcoTalkerAliasBlock3 = 0x07
+	taFormatISO8859_1     = 1
+)
+
+// buildTalkerAliasHeader encodes the first up-to-6 characters plus the
+// format/length options byte, then applies RS(12,9) parity like any other LC.
+func buildTalkerAliasHeader(text string) [12]byte {
+	var lc [9]byte
+	lc[0] = flcoTalkerAliasHeader
+	lc[1] = 0x00 // FID: standard feature set
+	length := byte(len(text))
+	lc[2] = (taFormatISO8859_1 << 6) | (length << 1)
+	chunk := text
+	if len(chunk) > 6 {
+		chunk = chunk[:6]
+	}
+	copy(lc[3:9], chunk)
+	return appendRS129(lc)
+}
+
+// buildTalkerAliasBlock encodes up to 7 characters for block 1, 2, or 3.
+func buildTalkerAliasBlock(flco byte, text string) [12]byte {
+	var lc [9]byte
+	lc[0] = flco
+	lc[1] = 0x00
+	chunk := text
+	if len(chunk) > 7 {
+		chunk = chunk[:7]
+	}
+	copy(lc[2:9], chunk)
+	return appendRS129(lc)
+}
+
+// appendRS129 mirrors the parity byte ordering used by buildFullLC.
+func appendRS129(lc [9]byte) [12]byte {
+	parity := rs129Encode(lc[:])
+	var full [12]byte
+	copy(full[0:9], lc[:])
+	full[9] = parity[2]
+	full[10] = parity[1]
+	full[11] = parity[0]
+	return full
+}
+
+// buildTalkerAliasMessages splits a callsign into the header plus as many
+// block messages as needed (up to 3), matching the 6+7+7+7 = 27 character
+// capacity of the Talker Alias LC scheme.
+func buildTalkerAliasMessages(callsign string) [][12]byte {
+	if callsign == "" {
+		return nil
+	}
+	if len(callsign) > 27 {
+		callsign = callsign[:27]
+	}
+	msgs := [][12]byte{buildTalkerAliasHeader(callsign)}
+	rest := callsign
+	if len(rest) > 6 {
+		rest = rest[6:]
+	} else {
+		rest = ""
+	}
+	blockFLCOs := []byte{flcoTalkerAliasBlock1, flcoTalkerAliasBlock2, flcoTalkerAliasBlock3}
+	for _, flco := range blockFLCOs {
+		if rest == "" {
+			break
+		}
+		chunk := rest
+		if len(chunk) > 7 {
+			chunk = chunk[:7]
+		}
+		msgs = append(msgs, buildTalkerAliasBlock(flco, chunk))
+		if len(rest) > 7 {
+			rest = rest[7:]
+		} else {
+			rest = ""
+		}
+	}
+	return msgs
+}

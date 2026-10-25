@@ -35,6 +35,7 @@ func main() {
 	asPassword := envRequired("ALLSTAR_PASSWORD")
 	asServer := envRequired("ALLSTAR_SERVER")
 	asPort := envInt("ALLSTAR_PORT", IAX2Port)
+	asLocalNode := os.Getenv("ALLSTAR_LOCAL_NODE")
 
 	nodeLocation := envDefault("NODE_LOCATION", "")
 	sysop := envDefault("SYSOP", "")
@@ -64,7 +65,7 @@ func main() {
 
 	for {
 		err := runBridge(svxHost, svxPort, svxAuthKey, svxTG, callsign, nodeLocation, sysop,
-			asServer, asPort, asNode, asPassword,
+			asServer, asPort, asNode, asLocalNode, asPassword,
 			opusDec, opusEnc, sigCh)
 
 		if err == errShutdown {
@@ -95,7 +96,7 @@ var errShutdown = fmt.Errorf("shutdown")
 
 func runBridge(
 	svxHost string, svxPort int, svxAuthKey string, svxTG uint32, callsign string, nodeLocation string, sysop string,
-	asServer string, asPort int, asNode string, asPassword string,
+	asServer string, asPort int, asNode string, asLocalNode string, asPassword string,
 	opusDec *opus.Decoder, opusEnc *opus.Encoder,
 	sigCh <-chan os.Signal,
 ) error {
@@ -257,7 +258,7 @@ func runBridge(
 	maxAsBackoff := time.Minute
 
 	for {
-		iax := NewIAX2Client(asServer, asPort, asNode, asPassword, asServer, callsign)
+		iax := NewIAX2Client(asServer, asPort, asNode, asLocalNode, asPassword, asServer, callsign)
 
 		// AllStar → SVXReflector audio path (ulaw → PCM → OPUS)
 		iax.SetAudioCallback(func(pcm []int16) {

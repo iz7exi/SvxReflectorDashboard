@@ -19,6 +19,21 @@ type RedisClient struct {
 	mu   sync.Mutex
 }
 
+// EnsureConnected reconnects if the connection was never established or was
+// lost (e.g. Redis restarted, or the container started before Redis's
+// hostname was resolvable). Safe to call before every operation; a no-op
+// when already connected. This is what makes the bridge self-heal instead
+// of permanently disabling real-talker publishing after one bad attempt.
+func (r *RedisClient) EnsureConnected() error {
+	r.mu.Lock()
+	if r.conn != nil {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+	return r.Connect()
+}
+
 // ParseRedisURL parses a redis:// URL and returns a RedisClient.
 // Format: redis://host:port/db
 func ParseRedisURL(rawURL string) (*RedisClient, error) {
@@ -55,6 +70,10 @@ func (r *RedisClient) Connect() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.conn != nil {
+		return nil // already connected (e.g. a concurrent EnsureConnected call won the race)
+	}
+
 	conn, err := net.DialTimeout("tcp", r.addr, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("redis connect: %w", err)
@@ -83,9 +102,15 @@ func (r *RedisClient) SetEX(key string, seconds int, value string) error {
 		return fmt.Errorf("redis not connected")
 	}
 	if err := r.sendCommandLocked("SETEX", key, strconv.Itoa(seconds), value); err != nil {
+		r.conn.Close()
+		r.conn = nil
 		return err
 	}
 	_, err := r.readLineLocked()
+	if err != nil {
+	r.conn.Close()
+		r.conn = nil
+	}
 	return err
 }
 

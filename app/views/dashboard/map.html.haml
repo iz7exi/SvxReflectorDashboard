@@ -211,10 +211,14 @@
         var offMapNodes = #{off_map_json};
 
         // ── Tile layers ────────────────────────────────────────────────────────────
+        // ESRI_DARK_FIX_APPLIED -- CartoDB's free "Dark" basemap now
+        // requires an API key we don't have, so this uses Esri's Dark
+        // Gray Canvas instead (same provider already trusted for the
+        // Satellite layer below, no key ever needed).
         var tileLayers = {
           '<i class="bi bi-moon-stars mr-1"></i>Dark': L.tileLayer(
-            'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-            { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>', subdomains: 'abcd', maxZoom: 19 }
+            'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+            { attribution: 'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, FAO, NOAA, USGS', maxZoom: 16 }
           ),
           '<i class="bi bi-signpost-2 mr-1"></i>Street': L.tileLayer(
             'https://tile.openstreetmap.org/{z}/{x}/{y}.png',

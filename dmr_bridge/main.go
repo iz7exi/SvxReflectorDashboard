@@ -31,7 +31,7 @@ type dmrConn interface {
 	SetVoiceCallback(func(srcID uint32, frames [3][9]byte))
 	SetCallStartCallback(func(srcID, dstID uint32))
 	SetCallEndCallback(func(srcID uint32))
-	StartTX()
+	StartTX(srcID uint32, callsign string) // REAL_CALLSIGN_DISPLAY
 	SendVoice(ambe [9]byte) error
 	StopTX() error
 }
@@ -45,6 +45,9 @@ func isODMRTP(proto string) bool {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("DMR Bridge starting...")
+	// DMR ID -> callsign lookup (radioid.net database baked into the
+	// image). Non-fatal if missing; falls back to numeric "DMR-<id>".
+	loadDMRIDTable("/usr/local/share/dmrids.csv")
 
 	// --- Configuration ---
 	svxHost := envRequired("REFLECTOR_HOST")
@@ -66,6 +69,9 @@ func main() {
 	dmrTimeslot := byte(envInt("DMR_TIMESLOT", 2) - 1) // 1-based → 0-based
 	dmrColorCode := byte(envInt("DMR_COLOR_CODE", 1))
 	dmrCallsign := envDefault("DMR_CALLSIGN", callsign)
+	dmrOptions := envDefault("DMR_OPTIONS", "")
+	dmrRXFreq := envDefault("DMR_RX_FREQ", "")
+	dmrTXFreq := envDefault("DMR_TX_FREQ", "")
 	nodeLocation := envDefault("NODE_LOCATION", "")
 	sysop := envDefault("SYSOP", "")
 
@@ -105,7 +111,7 @@ func main() {
 
 	for {
 		err := runBridge(svxHost, svxPort, svxAuthKey, svxTG, callsign, nodeLocation, sysop,
-			dmrProtocol, dmrHost, dmrPort, dmrID, dmrPassword, dmrCallsign, dmrTalkgroup, dmrTimeslot, dmrColorCode,
+			dmrProtocol, dmrHost, dmrPort, dmrID, dmrPassword, dmrCallsign, dmrOptions, dmrRXFreq, dmrTXFreq, dmrTalkgroup, dmrTimeslot, dmrColorCode,
 			redisURL, voc, opusDec, opusEnc, sigCh)
 
 		if err == errShutdown {
@@ -134,9 +140,19 @@ func main() {
 
 var errShutdown = fmt.Errorf("shutdown")
 
+// txItem is a queued SVX->DMR transmit item: either an AMBE voice frame
+// or a stop-transmission sentinel (isStop=true), processed in strict
+// FIFO order by the paced sender goroutine so the terminator is only
+// sent after all preceding real audio frames.
+type txItem struct {
+	ambe   [9]byte
+	isStop bool
+}
+
 func runBridge(
 	svxHost string, svxPort int, svxAuthKey string, svxTG uint32, callsign string, nodeLocation string, sysop string,
-	dmrProtocol string, dmrHost string, dmrPort int, dmrID uint32, dmrPassword string, dmrCallsign string,
+	dmrProtocol string, dmrHost string, dmrPort int, dmrID uint32, dmrPassword string, dmrCallsign string, dmrOptions string,
+	dmrRXFreq string, dmrTXFreq string,
 	dmrTalkgroup uint32, dmrTimeslot byte, dmrColorCode byte,
 	redisURL string, voc *Vocoder, opusDec *opus.Decoder, opusEnc *opus.Encoder,
 	sigCh <-chan os.Signal,
@@ -159,6 +175,11 @@ func runBridge(
 		// Voice bandpass filters for each direction
 		filterSvxToDmr = NewVoiceFilterFromEnv("FILTER_SVX_TO_EXT_", PCMSampleRate)
 		filterDmrToSvx = NewVoiceFilterFromEnv("FILTER_EXT_TO_SVX_", PCMSampleRate)
+		// Paced SVX->DMR transmit queue: decouples arrival jitter from SVX
+		// (network/goroutine timing) from a steady 20ms-per-frame DMR TX
+		// cadence, which matters for masters that transcode audio (e.g.
+		// XLX cross-mode to D-STAR/YSF) rather than just relaying bytes.
+		ambeTxCh = make(chan txItem, 64)
 		// Track current DMR source for Redis
 		currentSrcID uint32
 	)
@@ -196,7 +217,7 @@ func runBridge(
 	if isODMRTP(dmrProtocol) {
 		dmr = NewODMRTPClient(dmrHost, dmrPort, dmrID, dmrPassword, dmrCallsign, dmrTalkgroup)
 	} else {
-		dmr = NewDMRClient(dmrHost, dmrPort, dmrID, dmrPassword, dmrCallsign,
+		dmr = NewDMRClient(dmrHost, dmrPort, dmrID, dmrPassword, dmrCallsign, dmrOptions, dmrRXFreq, dmrTXFreq,
 			dmrTalkgroup, dmrTimeslot, dmrColorCode)
 	}
 
@@ -233,8 +254,10 @@ func runBridge(
 			ambeBufMu.Unlock()
 
 			ambe := voc.Encode(chunk)
-			if err := dmr.SendVoice(ambe); err != nil {
-				log.Printf("[SVX→DMR] SendVoice error: %v", err)
+			select {
+			case ambeTxCh <- txItem{ambe: ambe}:
+			default:
+				log.Println("[SVX→DMR] TX queue full, dropping frame")
 			}
 
 			ambeBufMu.Lock()
@@ -259,7 +282,30 @@ func runBridge(
 		ambeBuffer = ambeBuffer[:0]
 		ambeBufMu.Unlock()
 
-		dmr.StartTX()
+		// cs is already confirmed != this bridge's own callsign (checked
+		// above). If cs is actually another relay bridge's own fixed identity
+		// (Mumble/Zello/etc -- the SVX reflector protocol only ever shows a
+		// connected node's own fixed identity, never a per-message field, so
+		// those bridges can't pass through the real individual talker's name
+		// directly), check Redis for the real talker THEY published. Falls
+		// back to cs itself for a genuine direct SVX client (no Redis entry).
+		realCS := cs
+		if redisCli != nil {
+			redisCli.EnsureConnected()
+			if v, ok, _ := redisCli.Get("relay_talker:" + cs); ok && v != "" {
+				realCS = v
+			}
+		}
+		// Strip any suffix after the first hyphen (e.g. Zello usernames like
+		// "iz7exi-mobile", "iz7exi-maurizio"). Real amateur radio callsigns
+		// never contain a hyphen (enforced by the dashboard's own callsign
+		// format validation), so this is always safe and never truncates a
+		// genuine callsign.
+		if idx := strings.Index(realCS, "-"); idx > 0 {
+			realCS = realCS[:idx]
+		}
+		srcID, _ := lookupDMRIDByCallsign(realCS)
+		dmr.StartTX(srcID, realCS)
 	})
 
 	svx.SetTalkerStopCallback(func(tg uint32, cs string) {
@@ -284,14 +330,19 @@ func runBridge(
 			ambeBuffer = ambeBuffer[:0]
 			ambeBufMu.Unlock()
 			ambe := voc.Encode(chunk)
-			dmr.SendVoice(ambe)
+			select {
+			case ambeTxCh <- txItem{ambe: ambe}:
+			default:
+				log.Println("[SVX→DMR] TX queue full, dropping final frame")
+			}
 		} else {
 			ambeBufMu.Unlock()
 		}
 
-		if err := dmr.StopTX(); err != nil {
-			log.Printf("[SVX→DMR] StopTX error: %v", err)
-		}
+		// Queue the stop sentinel so it is only processed by the pacer
+		// after all preceding real audio frames have been sent, preserving
+		// correct ordering despite the added transmit queue.
+		ambeTxCh <- txItem{isStop: true}
 	})
 
 	// --- DMR → SVXReflector audio path ---
@@ -316,12 +367,13 @@ func runBridge(
 		// reflector announces the talker instead of racing this SETEX.
 		if redisCli != nil {
 			val := dmrRxJSON(srcID, dmrTalkgroup, dmrTimeslot)
+			redisCli.EnsureConnected()
 			if err := redisCli.SetEX(redisKey, 30, val); err != nil {
 				log.Printf("[Redis] SETEX error: %v", err)
 			}
 		}
 
-		svx.SendTalkerStart(svxTG, callsign)
+		svx.SendTalkerStart(svxTG, lookupDMRCallsign(srcID))
 
 		filterDmrToSvx.Reset()
 		agcDmrToSvx.Reset()
@@ -348,31 +400,33 @@ func runBridge(
 			pcmBufMu.Lock()
 			pcmBuffer = append(pcmBuffer, pcmSlice...)
 
-			// Encode to OPUS in 60ms chunks (480 samples)
-			if len(pcmBuffer) >= 480 {
-				samples := make([]int16, 480)
-				copy(samples, pcmBuffer[:480])
-				pcmBuffer = pcmBuffer[480:]
+			// Encode to OPUS in 20ms chunks (160 samples @ 8kHz), matching
+			// the SvxLink/SVXReflector convention every other client and
+			// bridge expects. Sending larger (e.g. 60ms) packets makes some
+			// decoders (e.g. mumble_bridge) fail with "buffer too small".
+			for len(pcmBuffer) >= 160 {
+				samples := make([]int16, 160)
+				copy(samples, pcmBuffer[:160])
+				pcmBuffer = pcmBuffer[160:]
 				pcmBufMu.Unlock()
 
 				opusBuf := make([]byte, 256)
 				n, err := opusEnc.Encode(samples, opusBuf)
 				if err != nil {
 					log.Printf("[DMR→SVX] OPUS encode error: %v", err)
-					continue
-				}
-
-				if err := svx.SendAudio(opusBuf[:n]); err != nil {
+				} else if err := svx.SendAudio(opusBuf[:n]); err != nil {
 					log.Printf("[DMR→SVX] SendAudio error: %v", err)
 				}
-			} else {
-				pcmBufMu.Unlock()
+
+				pcmBufMu.Lock()
 			}
+			pcmBufMu.Unlock()
 		}
 
 		// Refresh Redis TTL
 		if redisCli != nil {
 			val := dmrRxJSON(srcID, dmrTalkgroup, dmrTimeslot)
+			redisCli.EnsureConnected()
 			if err := redisCli.SetEX(redisKey, 30, val); err != nil {
 				log.Printf("[Redis] SETEX error: %v", err)
 			}
@@ -393,12 +447,12 @@ func runBridge(
 			samples := pcmBuffer
 			pcmBuffer = nil
 			pcmBufMu.Unlock()
-			// Pad to valid OPUS frame size
-			for len(samples) < 480 {
+			// Pad to valid OPUS frame size (20ms @ 8kHz)
+			for len(samples) < 160 {
 				samples = append(samples, 0)
 			}
 			opusBuf := make([]byte, 256)
-			n, err := opusEnc.Encode(samples[:480], opusBuf)
+			n, err := opusEnc.Encode(samples[:160], opusBuf)
 			if err == nil {
 				svx.SendAudio(opusBuf[:n])
 			}
@@ -439,6 +493,35 @@ func runBridge(
 	go svx.RunUDPReader()
 	go svx.RunUDPHeartbeat()
 	go dmr.RunReader()
+	if hb, ok := dmr.(*DMRClient); ok {
+		go hb.RunPinger()
+	}
+	// Paced SVX->DMR sender: drains ambeTxCh at a steady 20ms cadence,
+	// smoothing out arrival jitter from the SVX audio callback so DMR
+	// bursts leave at a regular rhythm (matters for masters that must
+	// transcode the audio, e.g. XLX bridging to D-STAR/YSF).
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-dmr.Done():
+				return
+			case <-ticker.C:
+				select {
+				case item := <-ambeTxCh:
+					if item.isStop {
+						if err := dmr.StopTX(); err != nil {
+							log.Printf("[SVX→DMR] StopTX error: %v", err)
+						}
+					} else if err := dmr.SendVoice(item.ambe); err != nil {
+						log.Printf("[SVX→DMR] SendVoice error: %v", err)
+					}
+				default:
+				}
+			}
+		}
+	}()
 
 	log.Printf("Bridge active: SVX TG %d ↔ DMR TG %d TS %d", svxTG, dmrTalkgroup, dmrTimeslot+1)
 
@@ -470,7 +553,8 @@ func runBridge(
 }
 
 func dmrRxJSON(srcID, talkgroup uint32, timeslot byte) string {
-	return fmt.Sprintf(`{"src_id":%d,"talkgroup":%d,"timeslot":%d}`, srcID, talkgroup, timeslot+1)
+	cs := lookupDMRCallsign(srcID)
+	return fmt.Sprintf(`{"src_id":%d,"callsign":%q,"talkgroup":%d,"timeslot":%d}`, srcID, cs, talkgroup, timeslot+1)
 }
 
 func envRequired(key string) string {

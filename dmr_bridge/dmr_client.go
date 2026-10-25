@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +17,9 @@ type DMRClient struct {
 	rptID     uint32
 	password  string
 	callsign  string
+	options   string
+	rxFreq    string
+	txFreq    string
 	talkgroup uint32
 	timeslot  byte
 	colorCode byte
@@ -24,10 +28,13 @@ type DMRClient struct {
 
 	// TX state
 	txStreamID uint32
+	txSrcID    uint32 // real per-call source ID (SVX talker), falls back to rptID
 	txSeq      byte
 	txBurst    int // 0-5 (A-F) burst counter
 	txBuf      [][9]byte
 	txMu       sync.Mutex
+	txActive   bool
+	embRaw     [128]bool // fragmented embedded LC for current call (dmrcon.c port)
 
 	// Callbacks
 	onVoice     func(srcID uint32, frames [3][9]byte)
@@ -42,7 +49,7 @@ type DMRClient struct {
 	missedPings int
 }
 
-func NewDMRClient(host string, port int, rptID uint32, password, callsign string,
+func NewDMRClient(host string, port int, rptID uint32, password, callsign, options, rxFreq, txFreq string,
 	talkgroup uint32, timeslot, colorCode byte) *DMRClient {
 	return &DMRClient{
 		host:      host,
@@ -50,6 +57,9 @@ func NewDMRClient(host string, port int, rptID uint32, password, callsign string
 		rptID:     rptID,
 		password:  password,
 		callsign:  callsign,
+		options:   options,
+		rxFreq:    rxFreq,
+		txFreq:    txFreq,
 		talkgroup: talkgroup,
 		timeslot:  timeslot,
 		colorCode: colorCode,
@@ -120,11 +130,33 @@ func (c *DMRClient) Connect() error {
 
 	// Step 3: Send RPTC (config)
 	ccStr := fmt.Sprintf("%d", c.colorCode)
-	configPkt := BuildConfigPacket(c.rptID, c.callsign,
-		"000000000", "000000000", // RX/TX freq (not applicable for bridge)
-		"01", ccStr,
-		"0.0000", "0.0000", "000", // lat, lon, height
-		"DMR Bridge", "STFU_0.3.4 Linux x86_64", "", "DMR_Bridge", "1.0")
+	rx := c.rxFreq
+	if rx == "" {
+		rx = "000000000"
+	}
+	tx := c.txFreq
+	if tx == "" {
+		tx = "000000000"
+	}
+	// TGIF_SWITCH_APPLIED -- TGIF's real RPTC layout has an extra 1-byte
+	// SLOTS field the standard Homebrew layout doesn't (verified against
+	// TGIF's own published source); using the standard layout against TGIF
+	// misaligns every field after DESCRIPTION. Every other master (HBLink3,
+	// BrandMeister, ADN, etc.) keeps using the unmodified standard function.
+	var configPkt []byte
+	if strings.Contains(strings.ToLower(c.host), "tgif") {
+		configPkt = BuildConfigPacketTGIF(c.rptID, c.callsign,
+			rx, tx,
+			"01", ccStr,
+			"0.0000", "0.0000", "000", // lat, lon, height
+			"DMR Bridge", "", "2", "", "20260827", "MMDVM")
+	} else {
+		configPkt = BuildConfigPacket(c.rptID, c.callsign,
+			rx, tx,
+			"01", ccStr,
+			"0.0000", "0.0000", "000", // lat, lon, height
+			"DMR Bridge", "", "", "20260827", "MMDVM")
+	}
 	if _, err := c.conn.Write(configPkt); err != nil {
 		return fmt.Errorf("send RPTC: %w", err)
 	}
@@ -133,6 +165,18 @@ func (c *DMRClient) Connect() error {
 		return fmt.Errorf("config ACK: %w", err)
 	}
 	log.Println("[DMR] Config accepted, connected to master")
+
+	// Step 4 (optional): Send RPTO (options string), e.g. for ADN-style
+	// static TG pinning ("TS2=22270;TIMER=0"). Not all masters expect or
+	// ACK this, so we send it best-effort and do not block waiting for a
+	// reply.
+	if c.options != "" {
+		if _, err := c.conn.Write(BuildOptionsPacket(c.rptID, c.options)); err != nil {
+			log.Printf("[DMR] send RPTO: %v", err)
+		} else {
+			log.Printf("[DMR] Sent options: %s", c.options)
+		}
+	}
 
 	return nil
 }
@@ -209,6 +253,14 @@ func (c *DMRClient) RunReader() {
 			continue
 		}
 
+		// MSTPONG — master's reply to our own RPTPING keepalive.
+		if n >= 7 && string(data[:7]) == SigMSTPO {
+			c.mu.Lock()
+			c.missedPings = 0
+			c.mu.Unlock()
+			continue
+		}
+
 		// MSTCL — master close
 		if n >= 5 && string(data[:5]) == SigMSTC {
 			log.Println("[DMR] Master sent close")
@@ -229,8 +281,13 @@ func (c *DMRClient) RunReader() {
 			if frame.Slot != c.timeslot {
 				continue
 			}
-			// Skip our own transmissions
-			if frame.RptID == c.rptID {
+			// Skip our own active transmission, matched by stream ID rather
+			// than RptID: some masters stamp RptID with our own ID on every
+			// incoming frame addressed to us, not just true echoes.
+			c.txMu.Lock()
+			selfEcho := c.txActive && frame.StreamID == c.txStreamID
+			c.txMu.Unlock()
+			if selfEcho {
 				continue
 			}
 
@@ -269,19 +326,26 @@ func (c *DMRClient) RunReader() {
 }
 
 // StartTX begins a new voice transmission to the DMR network.
-func (c *DMRClient) StartTX() {
+func (c *DMRClient) StartTX(srcID uint32, callsign string) {
+	_ = callsign // Homebrew path unaffected; real-caller ID already used for srcID here
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
+	if srcID == 0 {
+		srcID = c.rptID
+	}
+	c.txSrcID = srcID
 	c.txStreamID = rand.Uint32()
+	c.txActive = true
 	c.txSeq = 0
 	c.txBurst = 0
 	c.txBuf = c.txBuf[:0]
+	c.embRaw = buildEmbRaw(c.talkgroup, c.txSrcID)
 
-	log.Printf("[DMR] TX start: stream=%08X TG=%d TS=%d", c.txStreamID, c.talkgroup, c.timeslot+1)
+	log.Printf("[DMR] TX start: stream=%08X TG=%d TS=%d src=%d", c.txStreamID, c.talkgroup, c.timeslot+1, c.txSrcID)
 
 	// Send Voice LC Header
-	header := BuildVoiceLCHeader(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+	header := BuildVoiceLCHeader(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 		c.txStreamID, c.timeslot, CallTypeGroup)
 	c.conn.Write(header)
 	c.txSeq++
@@ -305,7 +369,7 @@ func (c *DMRClient) SendVoice(ambe [9]byte) error {
 	copy(frames[2][:], c.txBuf[2][:])
 	c.txBuf = c.txBuf[:0]
 
-	payload := BuildAMBEPayload(frames, c.txBurst)
+	payload := BuildAMBEPayload(frames, c.txBurst, c.colorCode, c.embRaw)
 
 	// Determine frame type
 	var frameType byte
@@ -315,7 +379,7 @@ func (c *DMRClient) SendVoice(ambe [9]byte) error {
 		frameType = FrameTypeVoice
 	}
 
-	pkt := BuildDMRDFrame(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+	pkt := BuildDMRDFrame(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 		c.timeslot, CallTypeGroup, frameType, byte(c.txBurst), c.txStreamID, payload)
 
 	_, err := c.conn.Write(pkt)
@@ -341,26 +405,52 @@ func (c *DMRClient) StopTX() error {
 		copy(frames[2][:], c.txBuf[2][:])
 		c.txBuf = c.txBuf[:0]
 
-		payload := BuildAMBEPayload(frames, c.txBurst)
+		payload := BuildAMBEPayload(frames, c.txBurst, c.colorCode, c.embRaw)
 		var frameType byte
 		if c.txBurst == 0 {
 			frameType = FrameTypeVoiceSync
 		} else {
 			frameType = FrameTypeVoice
 		}
-		pkt := BuildDMRDFrame(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+		pkt := BuildDMRDFrame(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 			c.timeslot, CallTypeGroup, frameType, byte(c.txBurst), c.txStreamID, payload)
 		c.conn.Write(pkt)
 		c.txSeq++
 	}
 
 	// Send Voice Terminator
-	term := BuildVoiceTerminator(c.txSeq, c.rptID, c.talkgroup, c.rptID,
+	term := BuildVoiceTerminator(c.txSeq, c.txSrcID, c.talkgroup, c.rptID,
 		c.txStreamID, c.timeslot, CallTypeGroup)
 	_, err := c.conn.Write(term)
 
+	c.txActive = false
 	log.Printf("[DMR] TX stop: stream=%08X", c.txStreamID)
 	return err
+}
+
+// RunPinger proactively sends RPTPING to the master on a fixed interval,
+// as required by the MMDVM Homebrew protocol (HBLink3 and compatible
+// masters expect the repeater to initiate keepalives; they do not always
+// send MSTPING on their own).
+func (c *DMRClient) RunPinger() {
+	log.Println("[DMR] RunPinger goroutine started")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.Done():
+			log.Println("[DMR] RunPinger stopping (done)")
+			return
+		case <-ticker.C:
+			if c.isClosed() {
+				log.Println("[DMR] RunPinger stopping (closed)")
+				return
+			}
+			n, err := c.conn.Write(BuildPingPacket(c.rptID))
+			log.Printf("[DMR] Sent RPTPING (%d bytes, err=%v)", n, err)
+		}
+	}
 }
 
 func (c *DMRClient) isClosed() bool {

@@ -19,6 +19,19 @@ type RedisClient struct {
 	mu   sync.Mutex
 }
 
+// EnsureConnected reconnects if the connection was never established or was
+// lost (e.g. Redis restarted, or the container started before Redis's
+// hostname was resolvable). Safe to call before every operation.
+func (r *RedisClient) EnsureConnected() error {
+	r.mu.Lock()
+	if r.conn != nil {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+	return r.Connect()
+}
+
 // ParseRedisURL parses a redis:// URL and returns a RedisClient.
 // Format: redis://host:port/db
 func ParseRedisURL(rawURL string) (*RedisClient, error) {
@@ -55,6 +68,10 @@ func (r *RedisClient) Connect() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.conn != nil {
+		return nil
+	}
+
 	conn, err := net.DialTimeout("tcp", r.addr, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("redis connect: %w", err)
@@ -87,6 +104,33 @@ func (r *RedisClient) SetEX(key string, seconds int, value string) error {
 	}
 	_, err := r.readLineLocked()
 	return err
+}
+
+// Get retrieves a key's value. Returns ok=false if the key does not exist
+// (or has expired).
+func (r *RedisClient) Get(key string) (value string, ok bool, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conn == nil {
+		return "", false, fmt.Errorf("redis not connected")
+	}
+	if err := r.sendCommandLocked("GET", key); err != nil {
+		return "", false, err
+	}
+	line, err := r.readLineLocked()
+	if err != nil {
+		return "", false, err
+	}
+	// Null bulk reply ("$-1"): key does not exist.
+	if strings.HasPrefix(line, "$-1") {
+		return "", false, nil
+	}
+	// Bulk reply ("$<len>\r\n<data>"): split off the length line.
+	parts := strings.SplitN(line, "\n", 2)
+	if len(parts) != 2 {
+		return "", false, fmt.Errorf("unexpected GET reply: %q", line)
+	}
+	return strings.TrimSpace(parts[1]), true, nil
 }
 
 // Del deletes a key.

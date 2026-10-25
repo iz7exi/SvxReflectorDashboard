@@ -221,7 +221,7 @@ module Admin
         :echolink_reject_conf, :echolink_use_gsm_only, :echolink_bind_addr,
         :echolink_servers, :default_active,
         :xlx_host, :xlx_port, :xlx_module, :xlx_callsign, :xlx_callsign_suffix, :xlx_mycall, :xlx_mycall_suffix, :xlx_reflector_name, :xlx_protocol,
-        :dmr_protocol, :dmr_host, :dmr_port, :dmr_id, :dmr_password, :dmr_talkgroup, :dmr_timeslot, :dmr_color_code, :dmr_callsign,
+        :dmr_protocol, :dmr_host, :dmr_port, :dmr_id, :dmr_password, :dmr_talkgroup, :dmr_timeslot, :dmr_color_code, :dmr_callsign, :dmr_options, :dmr_rx_freq, :dmr_tx_freq, :dmr_rx_freq, :dmr_tx_freq,
         :ysf_host, :ysf_port, :ysf_callsign, :ysf_description, :ysf_dgid,
         :allstar_node, :allstar_password, :allstar_server, :allstar_port,
         :iax_username, :iax_password, :iax_server, :iax_port,
@@ -380,6 +380,11 @@ module Admin
           "DMR_TALKGROUP=#{bridge.dmr_talkgroup}",
           "DMR_TIMESLOT=#{bridge.dmr_timeslot || 2}",
           "DMR_COLOR_CODE=#{bridge.dmr_color_code || 1}",
+          "DMR_OPTIONS=#{bridge.dmr_options}",
+          "DMR_RX_FREQ=#{bridge.dmr_rx_freq}",
+          "DMR_TX_FREQ=#{bridge.dmr_tx_freq}",
+          "DMR_RX_FREQ=#{bridge.dmr_rx_freq}",
+          "DMR_TX_FREQ=#{bridge.dmr_tx_freq}",
           "DMR_CALLSIGN=#{bridge.dmr_callsign.presence || bridge.local_callsign}",
           "NODE_LOCATION=#{bridge.node_location.presence || bridge.name}",
           "SYSOP=#{bridge.sysop}",
@@ -455,6 +460,7 @@ module Admin
           "REFLECTOR_TG=#{bridge.local_default_tg}",
           "CALLSIGN=#{bridge.local_callsign}",
           "ALLSTAR_NODE=#{bridge.allstar_node}",
+          "ALLSTAR_LOCAL_NODE=1998",
           "ALLSTAR_PASSWORD=#{bridge.allstar_password}",
           "ALLSTAR_SERVER=#{bridge.allstar_server}",
           "ALLSTAR_PORT=#{bridge.allstar_port || 4569}",
@@ -638,7 +644,8 @@ module Admin
           "MUMBLE_CHANNEL=#{bridge.mumble_channel}",
           "MUMBLE_WELCOME=#{[bridge.mumble_welcome.to_s].pack('m0')}",
           "NODE_LOCATION=#{bridge.node_location.presence || bridge.name}",
-          "SYSOP=#{bridge.sysop}"
+          "SYSOP=#{bridge.sysop}",
+          "REDIS_URL=#{ENV.fetch('REDIS_URL', 'redis://redis:6379/1')}"
         ] + agc_env_array(bridge),
         HostConfig: {
           RestartPolicy: { Name: "unless-stopped" }
@@ -677,8 +684,14 @@ module Admin
           "SYSOP=#{bridge.sysop}",
           "REDIS_URL=#{ENV.fetch('REDIS_URL', 'redis://redis:6379/1')}"
         ] + agc_env_array(bridge),
+        ExposedPorts: {
+          "#{bridge.usrp_rx_port || 41233}/udp" => {}
+        },
         HostConfig: {
-          RestartPolicy: { Name: "unless-stopped" }
+          RestartPolicy: { Name: "unless-stopped" },
+          PortBindings: {
+            "#{bridge.usrp_rx_port || 41233}/udp" => [{ "HostPort" => "#{bridge.usrp_rx_port || 41233}" }]
+          }
         }
       }
       body[:NetworkingConfig] = { EndpointsConfig: { network => {} } } if network
@@ -726,6 +739,18 @@ module Admin
           RestartPolicy: { Name: "unless-stopped" }
         }
       }
+      if bridge.echolink?
+        body[:ExposedPorts] = {
+          "5200/tcp" => {},
+          "5198/udp" => {},
+          "5199/udp" => {}
+        }
+        body[:HostConfig][:PortBindings] = {
+          "5200/tcp" => [{ "HostPort" => "5200" }],
+          "5198/udp" => [{ "HostPort" => "5198" }],
+          "5199/udp" => [{ "HostPort" => "5199" }]
+        }
+      end
       body[:NetworkingConfig] = { EndpointsConfig: { network => {} } } if network
 
       result = docker_api_post_json("/containers/create?name=#{bridge.container_name}", body)
